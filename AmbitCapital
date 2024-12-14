@@ -1,0 +1,121 @@
+pip install streamlit altair beautifulsoup4 pandas numpy matplotlib
+#Installing Packages 
+
+import streamlit as st
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
+
+def scrape_screener(symbol, consolidated=True):
+    base_url = f"https://www.screener.in/company/{symbol}/"
+    if consolidated:
+        url = base_url + "consolidated/"
+    else:
+        url = base_url
+
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise ValueError(f"Error fetching data for {symbol}: {response.status_code}")
+    
+    soup = BeautifulSoup(response.content, 'html.parser')
+    
+    # Extract key financials
+    data = {}
+    try:
+        data['current_pe'] = float(soup.find('li', text=lambda x: "P/E" in x).text.split(":")[1].strip())
+        rows = soup.find('table', {'class': 'data-table'}).find_all('tr')
+        
+        # Parse relevant rows for calculations
+        for row in rows:
+            cells = row.find_all('td')
+            if "Net Profit" in cells[0].text:
+                data['net_profit'] = [float(cell.text.replace(',', '')) for cell in cells[1:] if cell.text != '']
+            elif "RoCE" in cells[0].text:
+                data['roce'] = [float(cell.text.replace('%', '').strip()) for cell in cells[1:] if cell.text != '']
+            elif "Sales" in cells[0].text:
+                data['sales'] = [float(cell.text.replace(',', '')) for cell in cells[1:] if cell.text != '']
+    except Exception as e:
+        print(f"Error parsing data: {e}")
+    
+    return data
+
+#Calculation of metrics 
+
+
+def calculate_metrics(data):
+    # Calculate FY23 PE
+    market_cap = data['current_pe'] * data['net_profit'][-1]
+    fy23_pe = market_cap / data['net_profit'][-1]
+    
+    # 5-year median RoCE
+    median_roce = np.median(data['roce'][:-1])  # Exclude FY23
+    
+    # Compounded growth rates
+    def cagr(start, end, periods):
+        return ((end / start) ** (1 / periods)) - 1
+    
+    growth_rates = {
+        'sales_3y': cagr(data['sales'][-4], data['sales'][-1], 3),
+        'sales_5y': cagr(data['sales'][-6], data['sales'][-1], 5),
+        'profit_3y': cagr(data['net_profit'][-4], data['net_profit'][-1], 3),
+        'profit_5y': cagr(data['net_profit'][-6], data['net_profit'][-1], 5)
+    }
+    
+    return fy23_pe, median_roce, growth_rates
+
+
+def calculate_dcf(coc, roce, growth, high_growth_years, fade_years, terminal_growth_rate):
+    tax_rate = 0.25
+    intrinsic_pe = 0
+
+    # High-growth period
+    high_growth_cashflows = []
+    for year in range(1, high_growth_years + 1):
+        cashflow = roce * (1 - tax_rate) * (1 + growth) ** year
+        high_growth_cashflows.append(cashflow)
+
+    # Fade period
+    fade_growth_rate = np.linspace(growth, terminal_growth_rate, fade_years)
+    fade_cashflows = []
+    for year, g in enumerate(fade_growth_rate, start=high_growth_years + 1):
+        cashflow = roce * (1 - tax_rate) * (1 + g) ** year
+        fade_cashflows.append(cashflow)
+
+    # Terminal value
+    terminal_value = fade_cashflows[-1] / (coc - terminal_growth_rate)
+
+    # Discount to present value
+    cashflows = high_growth_cashflows + fade_cashflows
+    discounted_cashflows = [cf / ((1 + coc) ** i) for i, cf in enumerate(cashflows, start=1)]
+    intrinsic_pe = sum(discounted_cashflows) + terminal_value / ((1 + coc) ** len(cashflows))
+
+    return intrinsic_pe
+
+
+
+st.title("DCF Valuation Tool")
+
+# Input panel
+symbol = st.sidebar.text_input("Stock Symbol", "NESTLEIND")
+coc = st.sidebar.slider("Cost of Capital (%)", 5, 15, 10)
+roce = st.sidebar.slider("RoCE (%)", 5, 50, 20)
+growth = st.sidebar.slider("High Growth (%)", 0, 20, 10)
+high_growth_years = st.sidebar.slider("High Growth Years", 1, 20, 10)
+fade_years = st.sidebar.slider("Fade Period (Years)", 1, 20, 10)
+terminal_growth_rate = st.sidebar.slider("Terminal Growth Rate (%)", 0, 5, 2)
+
+# Fetch and process data
+data = scrape_screener(symbol)
+fy23_pe, median_roce, growth_rates = calculate_metrics(data)
+intrinsic_pe = calculate_dcf(coc / 100, roce / 100, growth / 100, high_growth_years, fade_years, terminal_growth_rate / 100)
+
+# Display results
+st.write(f"Current PE: {data['current_pe']}")
+st.write(f"FY23 PE: {fy23_pe}")
+st.write(f"5-Year Median RoCE: {median_roce}%")
+st.write("Compounded Growth Rates:", growth_rates)
+st.write(f"Intrinsic PE: {intrinsic_pe}")
+
+degree_of_overvaluation = (min(data['current_pe'], fy23_pe) / intrinsic_pe) - 1
+st.write(f"Degree of Overvaluation: {degree_of_overvaluation:.2%}")
